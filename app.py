@@ -5,15 +5,53 @@ import time
 from flask_cors import CORS
 from flask_mail import Mail, Message
 from datetime import datetime
-
-from feature_engine import (
-    build_basic_features,
-    temp_buffer,
-    current_buffer
-)
+from supabase import create_client
+import random
+import threading
 
 # =========================================================
-# INIT
+# FEATURE ENGINE MODULE (simplified)
+# =========================================================
+temp_buffer = []
+current_buffer = []
+
+def build_basic_features(temp, current):
+    """Build basic features for ML prediction"""
+    import pandas as pd
+    
+    # Add to buffers
+    temp_buffer.append(temp)
+    current_buffer.append(current)
+    
+    # Keep last 10 samples
+    if len(temp_buffer) > 10:
+        temp_buffer.pop(0)
+    if len(current_buffer) > 10:
+        current_buffer.pop(0)
+    
+    # Calculate features
+    temp_mean = sum(temp_buffer) / len(temp_buffer) if temp_buffer else temp
+    current_mean = sum(current_buffer) / len(current_buffer) if current_buffer else current
+    
+    temp_trend = temp_buffer[-1] - temp_buffer[0] if len(temp_buffer) >= 2 else 0
+    current_trend = current_buffer[-1] - current_buffer[0] if len(current_buffer) >= 2 else 0
+    
+    # Create DataFrame with features
+    df = pd.DataFrame({
+        'temperature': [temp],
+        'current': [current],
+        'temp_mean_10': [temp_mean],
+        'current_mean_10': [current_mean],
+        'temp_trend': [temp_trend],
+        'current_trend': [current_trend],
+        'temp_current_ratio': [temp / current if current > 0 else 0],
+        'power': [temp * current]
+    })
+    
+    return df
+
+# =========================================================
+# FLASK APP INIT
 # =========================================================
 app = Flask(__name__,
             template_folder='templates',
@@ -45,6 +83,36 @@ except Exception as e:
 # LOAD MODELS
 # =========================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Create dummy models if they don't exist
+if not os.path.exists(os.path.join(BASE_DIR, "ml/hotspot_model.pkl")):
+    print("⚠️ Models not found, creating dummy models...")
+    os.makedirs(os.path.join(BASE_DIR, "ml"), exist_ok=True)
+    
+    from sklearn.ensemble import RandomForestClassifier
+    import pandas as pd
+    import numpy as np
+    
+    # Create dummy training data
+    X_train = pd.DataFrame({
+        'temperature': np.random.rand(100),
+        'current': np.random.rand(100),
+        'temp_mean_10': np.random.rand(100),
+        'current_mean_10': np.random.rand(100),
+        'temp_trend': np.random.rand(100),
+        'current_trend': np.random.rand(100),
+        'temp_current_ratio': np.random.rand(100),
+        'power': np.random.rand(100)
+    })
+    y_train = np.random.randint(0, 2, 100)
+    
+    dummy_model = RandomForestClassifier()
+    dummy_model.fit(X_train, y_train)
+    dummy_model.feature_names_in_ = X_train.columns
+    
+    joblib.dump(dummy_model, os.path.join(BASE_DIR, "ml/hotspot_model.pkl"))
+    joblib.dump(dummy_model, os.path.join(BASE_DIR, "ml/overload_model.pkl"))
+    print("✓ Dummy models created")
 
 hotspot_model = joblib.load(
     os.path.join(BASE_DIR, "ml/hotspot_model.pkl")
@@ -310,6 +378,7 @@ def latest():
 @app.route("/full_history.html")
 def full_history():
     return render_template("full_history.html")
+
 # =========================================================
 # HEALTH CHECK
 # =========================================================
@@ -322,6 +391,82 @@ def health():
     })
 
 # =========================================================
+# SUPABASE SIMULATOR THREAD
+# =========================================================
+def supabase_simulator():
+    """Simulate sending data to Supabase"""
+    
+    SUPABASE_URL = "https://qkniqwgcwvxkgjciccad.supabase.co"
+    SUPABASE_KEY = "sb_publishable_pzHW1LlymSCVL876qchBKw_pPY0xN-2"
+    
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✓ Supabase client initialized")
+    except Exception as e:
+        print(f"✗ Supabase initialization error: {e}")
+        return
+    
+    def read_temperature():
+        return 25 + random.uniform(-5, 15)
+    
+    def read_current():
+        return 15 + random.uniform(-5, 25)
+    
+    print("="*50)
+    print("🚀 Breaker Monitor - Sending to Supabase (FAST MODE)")
+    print(f"📡 URL: {SUPABASE_URL}")
+    print("="*50)
+    
+    success = 0
+    errors = 0
+    
+    while True:
+        try:
+            temp = read_temperature()
+            current = read_current()
+            
+            # Determine state
+            if temp > 75 or current > 45:
+                state = "Overheating"
+                hot_prob = 0.92
+                ovl_prob = 0.88
+            elif temp > 60 or current > 35:
+                state = "Overload"
+                hot_prob = 0.78
+                ovl_prob = 0.72
+            elif temp > 50 or current > 28:
+                state = "Potential Overload"
+                hot_prob = 0.58
+                ovl_prob = 0.52
+            else:
+                state = "Normal"
+                hot_prob = 0.12
+                ovl_prob = 0.10
+            
+            composite = (hot_prob + ovl_prob) / 2
+            
+            data = {
+                "created_at": datetime.now().isoformat(),
+                "temperature_c": round(temp, 2),
+                "current_a": round(current, 2),
+                "breaker_state": state,
+                "hotspot_probability": round(hot_prob, 3),
+                "overload_probability": round(ovl_prob, 3),
+                "composite_risk": round(composite, 3)
+            }
+            
+            response = supabase.table("breaker_readings").insert(data).execute()
+            
+            success += 1
+            print(f"✅ [{success}] Sent to Supabase: {temp:.1f}°C, {current:.1f}A, {state}")
+            
+        except Exception as e:
+            errors += 1
+            print(f"❌ Supabase Error: {e}")
+        
+        time.sleep(1)  # Sends every 1 second
+
+# =========================================================
 # RUN SERVER
 # =========================================================
 if __name__ == "__main__":
@@ -330,5 +475,11 @@ if __name__ == "__main__":
     print("⚡ SMART PANEL MONITORING SYSTEM")
     print("🔥 Predictive ML Protection Enabled")
     print("===================================")
-
+    
+    # Start Supabase simulator in a separate thread
+    supabase_thread = threading.Thread(target=supabase_simulator, daemon=True)
+    supabase_thread.start()
+    print("✓ Supabase simulator thread started")
+    
+    # Run Flask app
     app.run(host="0.0.0.0", port=5000, debug=False)
